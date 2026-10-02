@@ -8,7 +8,7 @@ Standard library only. Usage:
 Options:
     --out DIR      output folder (default: reports)
     --sender NAME  your name, used in the emails
-    --price N      the fix-everything price quoted in reports/emails (default 149)
+    --price N      the fix-everything price quoted in reports/emails (default 199)
 """
 import argparse
 import csv
@@ -113,6 +113,19 @@ class PageParser(HTMLParser):
 
 
 # ---------------------------------------------------------------- checks
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+JUNK_EMAIL = re.compile(r"example\.|sentry|wixpress|\.(png|jpe?g|gif|webp|svg)$|^(noreply|no-reply)@", re.I)
+
+
+def find_email(hrefs, page, host):
+    """Best contact email: prefer mailto links and addresses on the site's own domain."""
+    found = [urllib.parse.unquote(h[7:].split("?")[0]).strip() for h in hrefs if h.lower().startswith("mailto:")]
+    found += EMAIL_RE.findall(page)
+    found = [e for e in dict.fromkeys(found) if EMAIL_RE.fullmatch(e) and not JUNK_EMAIL.search(e)]
+    domain = host.lower().removeprefix("www.")
+    found.sort(key=lambda e: (not e.lower().endswith(domain), not e.lower().startswith(("info@", "hello@", "contact@", "enquiries@", "office@"))))
+    return found[0] if found else ""
 
 def normalise(url):
     url = url.strip()
@@ -222,7 +235,8 @@ def audit(url):
     if not has_tel:
         add(2, "Phone number isn't tap-to-call",
             "Mobile visitors can't call with one tap; many won't copy the number by hand.")
-    if not has_tel and not has_mail and p.forms == 0:
+    has_contact_page = any(re.search(r"contact|get-in-touch|enquir", h, re.I) for h in hrefs)
+    if not has_tel and not has_mail and p.forms == 0 and not has_contact_page:
         add(3, "No obvious way to contact the business",
             "Visitors ready to buy have no easy way to get in touch.")
 
@@ -237,12 +251,31 @@ def audit(url):
     if status_of(base + "/sitemap.xml") >= 400 and status_of(base + "/sitemap_index.xml") >= 400:
         add(1, "No sitemap.xml", "Google discovers and indexes new pages more slowly.")
 
-    # Broken links (sample up to 40)
+    # Contact email: mailto links, then visible text, then the contact page.
+    stats["email"] = find_email(hrefs, page, urllib.parse.urlparse(final).netloc)
+    if not stats["email"]:
+        contact = next((urllib.parse.urljoin(final, h) for h in hrefs
+                        if re.search(r"contact|get-in-touch|about", h, re.I)), None)
+        if contact:
+            try:
+                _, _, _, cbody, _ = fetch(contact)
+                cp = PageParser()
+                cp.feed(cbody.decode("utf-8", errors="replace"))
+                stats["email"] = find_email(cp.links, cbody.decode("utf-8", errors="replace"),
+                                            urllib.parse.urlparse(final).netloc)
+            except Exception:
+                pass
+
+    # Broken links: own-site pages only (social sites block bots and would
+    # show up as false positives). Sample up to 40.
+    own = urllib.parse.urlparse(final).netloc.lower().removeprefix("www.")
     targets = []
     for h in hrefs:
         if h.startswith(("#", "mailto:", "tel:", "javascript:", "sms:")):
             continue
         absu = urllib.parse.urljoin(final, h).split("#")[0]
+        if urllib.parse.urlparse(absu).netloc.lower().removeprefix("www.") != own:
+            continue
         if absu.startswith("http") and absu not in targets:
             targets.append(absu)
     targets = targets[:40]
@@ -321,8 +354,6 @@ If you'd like, I can fix all of it for a flat ${price}, usually within 48 hours,
 
 Thanks,
 {sender}
-
-(If you'd rather not hear from me again, just reply "no thanks" and I won't follow up.)
 """
 
 
@@ -347,7 +378,7 @@ def main():
     ap.add_argument("inputs", nargs="+")
     ap.add_argument("--out", default="reports")
     ap.add_argument("--sender", default="Your Name")
-    ap.add_argument("--price", type=int, default=149)
+    ap.add_argument("--price", type=int, default=199)
     a = ap.parse_args()
 
     targets = load_targets(a.inputs)
@@ -373,7 +404,7 @@ def main():
                 with open(os.path.join(a.out, base + ".email.txt"), "w", encoding="utf-8") as f:
                     f.write(email_text(r, t["name"], a.price, a.sender))
             crit = sum(1 for s, _, _ in r["issues"] if s == 3)
-            summary.append({"name": t["name"], "email": t["email"], "city": t["city"], "url": t["url"],
+            summary.append({"name": t["name"], "email": t["email"] or r.get("email", ""), "city": t["city"], "url": t["url"],
                             "score": r.get("score"), "issues": len(r["issues"]), "critical": crit,
                             "top_issue": r["issues"][0][1] if r["issues"] else "",
                             "report": base + ".html", "error": r.get("error", "")})
